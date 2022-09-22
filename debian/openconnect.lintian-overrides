@@ -1,0 +1,2 @@
+# This script is intended to be ran on Android distributions.
+openconnect: wrong-path-for-interpreter /system/bin/sh != /bin/sh [usr/libexec/openconnect/hipreport-android.sh]

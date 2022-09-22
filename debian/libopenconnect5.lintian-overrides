@@ -1,0 +1,2 @@
+# Patch has not yet been merged upstream, so the symbol has to contain the Debian revision
+libopenconnect5: symbols-file-contains-debian-revision on symbol OPENCONNECT_5_6_1@OPENCONNECT_5_6_1 and 2 others (libopenconnect.so.5)
