@@ -80,7 +80,7 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	struct oc_form_opt *opt, *opt2;
 	char *prompt = NULL, *username_label = NULL, *password_label = NULL;
 	char *s = NULL, *saml_method = NULL, *saml_path = NULL;
-	int result = 0;
+	int result = -EINVAL;
 
 	if (!xmlnode_is_named(xml_node, "prelogin-response"))
 		goto out;
@@ -88,9 +88,9 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	for (xml_node = xml_node->children; xml_node; xml_node = xml_node->next) {
 		xmlnode_get_val(xml_node, "saml-request", &s);
 		xmlnode_get_val(xml_node, "saml-auth-method", &saml_method);
-		xmlnode_get_val(xml_node, "authentication-message", &prompt);
-		xmlnode_get_val(xml_node, "username-label", &username_label);
-		xmlnode_get_val(xml_node, "password-label", &password_label);
+		xmlnode_get_trimmed_val(xml_node, "authentication-message", &prompt);
+		xmlnode_get_trimmed_val(xml_node, "username-label", &username_label);
+		xmlnode_get_trimmed_val(xml_node, "password-label", &password_label);
 		/* XX: should we save the certificate username from <ccusername/> ? */
 	}
 
@@ -110,41 +110,31 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 				if (len < 0) {
 					vpn_progress(vpninfo, PRG_ERR, "Could not decode SAML request as base64: %s\n", s);
 					free(s);
-					result = -EINVAL;
 					goto out;
 				}
 				free(s);
 				realloc_inplace(saml_path, len+1);
-				if (!saml_path) {
-					result = -ENOMEM;
-					goto out;
-				}
+				if (!saml_path)
+					goto nomem;
 				saml_path[len] = '\0';
 				vpninfo->sso_login = strdup(saml_path);
 				prompt = strdup("SAML REDIRECT authentication in progress");
-				if (!vpninfo->sso_login || !prompt) {
-					result = -ENOMEM;
-					goto out;
-				}
+				if (!vpninfo->sso_login || !prompt)
+					goto nomem;
 			} else if (!strcmp(saml_method, "POST")) {
 				const char *prefix = "data:text/html;base64,";
 				saml_path = s;
 				realloc_inplace(saml_path, strlen(saml_path)+strlen(prefix)+1);
-				if (!saml_path) {
-					result = -ENOMEM;
-					goto out;
-				}
+				if (!saml_path)
+					goto nomem;
 				memmove(saml_path + strlen(prefix), saml_path, strlen(saml_path) + 1);
 				memcpy(saml_path, prefix, strlen(prefix));
 				vpninfo->sso_login = strdup(saml_path);
 				prompt = strdup("SAML REDIRECT authentication in progress");
-				if (!vpninfo->sso_login || !prompt) {
-					result = -ENOMEM;
-					goto out;
-				}
+				if (!vpninfo->sso_login || !prompt)
+					goto nomem;
 			} else {
 				vpn_progress(vpninfo, PRG_ERR, "Unknown SAML method %s\n", saml_method);
-				result = -EINVAL;
 				goto out;
 			}
 
@@ -156,7 +146,6 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 			if (!vpninfo->open_webview) {
 				vpn_progress(vpninfo,
 					PRG_ERR, _("When SAML authentication is complete, specify destination form field by appending :field_name to login URL.\n"));
-				result = -EINVAL;
 				goto out;
 			}
 		}
@@ -181,7 +170,7 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	opt->name = strdup("user");
 	if (!opt->name)
 		goto nomem;
-	if (asprintf(&opt->label, "%s: ", username_label ? : _("Username")) == 0)
+	if (asprintf(&opt->label, "%s: ", username_label ? : _("Username")) <= 0)
 		goto nomem;
 	if (!ctx->username)
 		opt->type = saml_path ? OC_FORM_OPT_SSO_USER : OC_FORM_OPT_TEXT;
@@ -198,7 +187,7 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	opt2->name = strdup(ctx->alt_secret ? : "passwd");
 	if (!opt2->name)
 		goto nomem;
-	if (asprintf(&opt2->label, "%s: ", ctx->alt_secret ? : password_label ? : _("Password")) == 0)
+	if (asprintf(&opt2->label, "%s: ", ctx->alt_secret ? : password_label ? : _("Password")) <= 0)
 		goto nomem;
 
 	/* XX: Some VPNs use a password in the first form, followed by a
@@ -217,6 +206,7 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	else
 		opt2->type = OC_FORM_OPT_PASSWORD;
 
+	result = 0;
 	vpn_progress(vpninfo, PRG_TRACE, "Prelogin form %s: \"%s\" %s(%s)=%s, \"%s\" %s(%s)\n",
 	             form->auth_id,
 	             opt->label, opt->name, opt->type == OC_FORM_OPT_SSO_USER ? "SSO" : opt->type == OC_FORM_OPT_TEXT ? "TEXT" : "HIDDEN", opt->_value,
@@ -458,9 +448,33 @@ static int parse_portal_xml(struct openconnect_info *vpninfo, xmlNode *xml_node,
 	/*
 	 * The portal contains a ton of stuff, but basically none of it is
 	 * useful to a VPN client that wishes to give control to the client
-	 * user, as opposed to the VPN administrator.  The exceptions are the
-	 * list of gateways in policy/gateways/external/list and the interval
-	 * for HIP checks in policy/hip-collection/hip-report-interval
+	 * user, as opposed to the VPN administrator.  The exception is
+	 * the list of gateways in policy/gateways/external/list.
+	 *
+	 * There are other fields which are worthless in terms of end-user
+	 * functionality, but are needed for compliance with the server's
+	 * security policies:
+	 * - Interval for HIP checks in policy/hip-collection/hip-report-interval
+	 *   (save so that we can rerun HIP on the expected interval)
+	 * - Software version (save so we can mindlessly parrot it back)
+	 *
+	 * Potentially also useful, but currently ignored:
+	 * - welcome-page/page, help-page, and help-page-2 contents might in
+	 *   principle be informative, but in practice they're either empty
+	 *   or extremely verbose multi-page boilerplate in HTML format
+	 * - hip-collection/default/category/member[] might be useful
+	 *   to report to the user as a diagnostic, so that they know what
+	 *   HIP report entries the server expects, if their HIP report
+	 *   isn't expected. In practice, servers that actually check the HIP
+	 *   report contents are so nitpicky that anything less than a
+	 *   capture from an officially-supported client is unlikely to help.
+	 * - root-ca/entry[]/cert is potentially useful because it contains
+	 *   certs that we should allow as root-of-trust for the gateway
+	 *   servers. This could prevent users from having to specify --cafile
+	 *   or repeated --servercert in order to allow non-interactive
+	 *   authentication to gateways whose certs aren't trusted by the
+	 *   system but ARE trusted by the portal (see example at
+         *   https://github.com/dlenski/openconnect/issues/128).
 	 */
 	if (xmlnode_is_named(xml_node, "policy")) {
 		for (x = xml_node->children; x; x = x->next) {
@@ -484,6 +498,13 @@ static int parse_portal_xml(struct openconnect_info *vpninfo, xmlNode *xml_node,
 						}
 					}
 				}
+			} else if (!xmlnode_get_trimmed_val(x, "version", &vpninfo->csd_ticket)) {
+				/* We abuse csd_ticket to store the portal's software version. Parroting this back as
+				 * the client software version (app-version) appears to be the best way to prevent the
+				 * gateway server from rejecting the connection due to obsolete client software.
+				 */
+				vpn_progress(vpninfo, PRG_INFO, _("Portal reports GlobalProtect version %s; we will report the same client version.\n"),
+					     vpninfo->csd_ticket);
 			} else {
 				xmlnode_get_val(x, "portal-name", &portal);
 				if (!xmlnode_get_val(x, "portal-userauthcookie", &ctx->portal_userauthcookie)) {
@@ -503,6 +524,9 @@ static int parse_portal_xml(struct openconnect_info *vpninfo, xmlNode *xml_node,
 	}
 
 	if (!gateways) {
+no_gateways:
+		vpn_progress(vpninfo, PRG_ERR,
+					 _("GlobalProtect portal configuration lists no gateway servers.\n"));
 		result = -EINVAL;
 		goto out;
 	}
@@ -512,7 +536,7 @@ static int parse_portal_xml(struct openconnect_info *vpninfo, xmlNode *xml_node,
 		buf_append(buf, "<GPPortal>\n  <ServerList>\n");
 		if (portal) {
 			buf_append(buf, "      <HostEntry><HostName>");
-			buf_append_xmlescaped(buf, portal);
+			buf_append_xmlescaped(buf, portal ? : _("unknown"));
 			buf_append(buf, "</HostName><HostAddress>%s", vpninfo->hostname);
 			if (vpninfo->port!=443)
 				buf_append(buf, ":%d", vpninfo->port);
@@ -557,12 +581,8 @@ static int parse_portal_xml(struct openconnect_info *vpninfo, xmlNode *xml_node,
 				     choice->label, choice->name);
 		}
 	}
-	if (!opt->nr_choices) {
-		vpn_progress(vpninfo, PRG_ERR,
-					 _("GlobalProtect portal configuration lists no gateway servers.\n"));
-		result = -EINVAL;
-		goto out;
-	}
+	if (!opt->nr_choices)
+		goto no_gateways;
 	if (!vpninfo->authgroup && opt->nr_choices)
 		vpninfo->authgroup = strdup(opt->choices[0]->name);
 

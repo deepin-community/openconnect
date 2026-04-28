@@ -1,4 +1,4 @@
-AC_INIT([openconnect], [9.01])
+AC_INIT([openconnect], [9.12])
 AC_LANG([C])
 AC_CONFIG_HEADERS([config.h])
 m4_ifdef([AC_CONFIG_MACRO_DIRS], [AC_CONFIG_MACRO_DIRS([m4])])
@@ -9,7 +9,7 @@ AM_MAINTAINER_MODE([enable])
 AM_INIT_AUTOMAKE([foreign tar-ustar subdir-objects])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
-AC_PREREQ([2.62], [], [AC_SUBST([localedir], ['$(datadir)/locale'])])
+AC_PREREQ([2.62])
 
 # Upstream's pkg.m4 (since 0.27) offers this now, but define our own
 # compatible version in case the local version of pkgconfig isn't new enough.
@@ -73,7 +73,7 @@ case $host_os in
     system_pcsc_cflags=
     AC_CHECK_TOOL([WINDRES], [windres], [])
     AC_CHECK_TOOL([MAKENSIS], [makensis], [])
-    default_browser=
+    default_browser=open
 
     case $host_cpu in
 	x86_64|amd64)
@@ -135,7 +135,9 @@ AC_ARG_WITH([external-browser],
 	  [command to use for spawning external web browser])])
 
 if test "$with_external_browser" = "yes" || test "$with_external_browser" = ""; then
-   if test "$default_browser" != ""; then
+   if test "$have_win" != ""; then
+      with_external_browser=${default_browser}
+   elif test "$default_browser" != ""; then
       AC_MSG_CHECKING([for ${default_browser}])
       AC_PATH_PROG(with_external_browser, ${default_browser}, no)
    else
@@ -143,7 +145,7 @@ if test "$with_external_browser" = "yes" || test "$with_external_browser" = ""; 
    fi
 fi
 if test "$with_external_browser" != "no"; then
-   if test -x "${with_external_browser}"; then
+   if test -x "${with_external_browser}" -o -n "$have_win"; then
       AC_DEFINE_UNQUOTED(DEFAULT_EXTERNAL_BROWSER, "${with_external_browser}", [External browser executable])
    else
       AC_MSG_ERROR([${with_external_browser} does not seem to be executable.])
@@ -785,6 +787,7 @@ case x"$with_gnutls_tss2" in
 	;;
 esac
 
+AM_CONDITIONAL(OPENCONNECT_SYSTEM_KEYS, [ test "$ac_cv_func_gnutls_system_key_add_x509" = "yes" ])
 AM_CONDITIONAL(OPENCONNECT_TSS2_ESYS, [ test "$tss2lib" = "tss2-esys" ])
 AM_CONDITIONAL(OPENCONNECT_TSS2_IBM, [ test "$tss2lib" = "ibmtss" -o "$tss2lib" = "tss" ])
 
@@ -891,6 +894,28 @@ PKG_CHECK_MODULES([LIBLZ4], [liblz4], [
 ])
 fi
 
+if test "$build_nsis" = "yes"; then
+   case $host_os in
+      *mingw32*)
+         if test "$host_cpu" = "x86_64"; then
+             winsys=MinGW64
+         else
+             winsys=MinGW32
+         fi
+	 ;;
+      *mingw64*)
+         winsys=MinGW64
+         ;;
+      *msys*)
+         winsys=MSYS
+         ;;
+      *)
+         winsys=Unknown
+         ;;
+   esac
+   AC_SUBST(INSTALLER_SUFFIX, [${winsys}-${ssl_library}])
+fi
+
 # For some bizarre reason now that we use AM_ICONV, the mingw32 build doesn't
 # manage to set EGREP properly in the created ./libtool script. Make sure it's
 # found.
@@ -917,6 +942,7 @@ AS_IF([test "$with_builtin_json" != "yes"],
 	[PKG_CHECK_MODULES(JSON, json-parser,
 			   [AC_SUBST(JSON_PC, [json-parser])
 			    json=system], [:])
+	 AC_DEFINE(HAVE_JSON, 1, [Have system json-parser package])
       ])
 
 AS_IF([test "$with_builtin_json" != "no"  && test "$json" = "" ],
@@ -926,6 +952,7 @@ AS_IF([test "$with_builtin_json" != "no"  && test "$json" = "" ],
 	 LIBS="$oldLIBS"
 	 AC_SUBST([JSON_LIBS], [$ac_cv_search_pow])
 	 AC_SUBST([JSON_CFLAGS], ['-I$(srcdir)/json'])
+	 AC_DEFINE(HAVE_JSON, 1, [Have builtin json-parser package])
       ])
 
 AS_IF([test "$json" = ""],
@@ -1345,6 +1372,19 @@ if test "$enable_flask_tests" = "yes" -a -n "${ac_cv_path_PYTHON}"; then
     fi
 fi
 AM_CONDITIONAL(HAVE_PYTHON36_FLASK, test "$have_python36_flask" = yes)
+
+have_python37_dataclasses=no
+if test "$enable_flask_tests" = "yes" -a -n "${ac_cv_path_PYTHON}"; then
+    AC_MSG_CHECKING([for Python 3.7+ or 3.6 with dataclasses backport])
+    python3 -c 'import sys; assert sys.version_info >= (3,6); import dataclasses' 2>/dev/null
+    if test $? -ne 0 ; then
+        AC_MSG_RESULT(not found)
+    else
+        have_python37_dataclasses=yes
+        AC_MSG_RESULT(found)
+    fi
+fi
+AM_CONDITIONAL(HAVE_PYTHON37_DATACLASSES, test "$have_python37_dataclasses" = yes)
 
 if test "$enable_ppp_tests" = "yes"; then
     AC_PATH_PROGS(SOCAT, [socat], [], $PATH:/bin:/usr/bin)

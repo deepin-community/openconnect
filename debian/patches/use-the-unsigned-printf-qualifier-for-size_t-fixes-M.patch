@@ -1,0 +1,27 @@
+From: Timothee 'TTimo' Besset <ttimo@ttimo.net>
+Date: Sun, 26 Nov 2023 10:13:05 -0600
+Subject: use the unsigned printf qualifier for size_t : fixes MinGW{32,64}
+ build
+Origin: https://gitlab.com/openconnect/openconnect/-/commit/958a59aed57df84a8ff0c86e1d0c6a4542edf5b2
+
+Signed-off-by: Timothee Besset <ttimo@ttimo.net>
+---
+ openssl.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/openssl.c b/openssl.c
+index f8e0b1e9dd7b..dd4d761d971a 100644
+--- a/openssl.c
++++ b/openssl.c
+@@ -2522,7 +2522,7 @@ void append_strap_verify(struct openconnect_info *vpninfo,
+ 
+ 	if (flen > sizeof(finished)) {
+ 		vpn_progress(vpninfo, PRG_ERR,
+-			     _("SSL Finished message too large (%zd bytes)\n"), flen);
++			     _("SSL Finished message too large (%zu bytes)\n"), flen);
+ 		if (!buf_error(buf))
+ 			buf->error = -EIO;
+ 		return;
+-- 
+2.51.0
+

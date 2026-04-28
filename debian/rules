@@ -1,6 +1,7 @@
 #!/usr/bin/make -f
 
 include /usr/share/dpkg/pkg-info.mk
+include /usr/share/debhelper/dh_package_notes/package-notes.mk
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 

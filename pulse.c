@@ -380,11 +380,6 @@ static int process_attr(struct openconnect_info *vpninfo, struct oc_vpn_option *
 		vpn_progress(vpninfo, PRG_DEBUG, _("Received DNS search domain %.*s\n"),
 			     attrlen, (char *)data);
 		new_ip_info->domain = add_option_dup(new_opts, "search", (char *)data, attrlen);
-		if (new_ip_info->domain) {
-			char *p = (char *)new_ip_info->domain;
-			while ((p = strchr(p, ',')))
-				*p = ' ';
-		}
 		break;
 
 	case 0x400b:
@@ -506,6 +501,21 @@ static int process_attr(struct openconnect_info *vpninfo, struct oc_vpn_option *
 		add_option_dup(new_opts, "gateway6", buf, -1);
 		break;
 
+	case 0x4024:
+	        /* This flag is supposed to be available starting with Pulse server 9.1R9 (see
+		 * https://help.ivanti.com/ps/legacy/pcs/9.1rx/9.1r9/ps-pcs-sa-9.1r9.0-releasenotes.pdf),
+		 * but it appears that it also requires a certain minimum CLIENT version to
+		 * be advertised in order for the server to send it (22.2.1.1295 is insufficient;
+		 * see https://gitlab.com/openconnect/openconnect/-/issues/506#note_1146848739).
+		 */
+		if (attrlen != 1)
+			goto badlen;
+		vpninfo->pulse_esp_unstupid = data[0];
+		vpn_progress(vpninfo, PRG_DEBUG,
+			     _("Pulse ESP tunnel allowed to carry 6in4 or 4in6 traffic: %d\n"),
+			     vpninfo->pulse_esp_unstupid);
+		break;
+
 	/* 0x4022: disable proxy
 	   0x400a: preserve proxy
 	   0x4008: proxy (string)
@@ -515,6 +525,7 @@ static int process_attr(struct openconnect_info *vpninfo, struct oc_vpn_option *
 	   0x401f:  tunnel routes with subnet access (also 4001 set)
 	   0x4020: Enforce IPv4
 	   0x4021: Enforce IPv6
+	   0x0014: Prefer FQDN resources over IP resources in case of a split tunneling conflict
 	*/
 
 	default:
@@ -762,11 +773,13 @@ static int pulse_request_realm_entry(struct openconnect_info *vpninfo, struct oc
 }
 
 static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
-				      int realms, unsigned char *eap)
+				      int realms, unsigned char *eap, int is_region)
 {
 	uint8_t avp_flags;
 	uint32_t avp_code;
 	uint32_t avp_vendor;
+	uint32_t expected_avp_code;
+	uint32_t reply_code;
 	int avp_len;
 	void *avp_p;
 	struct oc_auth_form f;
@@ -780,16 +793,27 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 
 	memset(&f, 0, sizeof(f));
 	memset(&o, 0, sizeof(o));
-	f.auth_id = (char *)"pulse_realm_choice";
-	f.opts = &o.form;
-	f.authgroup_opt = &o;
-	f.authgroup_selection = 1;
-	f.message = _("Choose Pulse user realm:");
 
+	f.opts = &o.form;
 	o.form.next = NULL;
 	o.form.type = OC_FORM_OPT_SELECT;
-	o.form.name = (char *)"realm_choice";
-	o.form.label = (char *)_("Realm:");
+	if (!is_region) {
+		f.auth_id = (char *)"pulse_realm_choice";
+		f.authgroup_opt = &o;
+		f.authgroup_selection = 1;
+		f.message = _("Choose Pulse user realm:");
+		o.form.name = (char *)"realm_choice";
+		o.form.label = (char *)_("Realm:");
+		expected_avp_code = 0xd4e;
+		reply_code = 0xd50;
+	} else {
+		f.auth_id = (char *)"pulse_region_choice";
+		f.message = _("Choose Pulse region:");
+		o.form.name = (char *)"region_choice";
+		o.form.label = (char *)_("Region:");
+		expected_avp_code = 0xd51;
+		reply_code = 0xd52;
+	}
 
 	o.nr_choices = realms;
 	o.choices = calloc(realms, sizeof(*o.choices));
@@ -804,7 +828,7 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 			ret = -EINVAL;
 			goto out;
 		}
-		if (avp_vendor != VENDOR_JUNIPER2 || avp_code != 0xd4e)
+		if (avp_vendor != VENDOR_JUNIPER2 || avp_code != expected_avp_code)
 			continue;
 
 		o.choices[i] = malloc(sizeof(struct oc_choice));
@@ -828,7 +852,7 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 	} while (ret == OC_FORM_RESULT_NEWGROUP);
 
 	if (!ret)
-		buf_append_avp_string(reqbuf, 0xd50, o.form._value);
+		buf_append_avp_string(reqbuf, reply_code, o.form._value);
  out:
 	if (o.choices) {
 		for (i = 0; i < realms; i++) {
@@ -1324,7 +1348,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	void *avp_p, *p;
 	unsigned char *eap;
 	int cookie_found = 0;
-	int j2_found = 0, realms_found = 0, realm_entry = 0, old_sessions = 0, gtc_found = 0;
+	int j2_found = 0, realms_found = 0, realm_entry = 0, old_sessions = 0, gtc_found = 0, regions_found = 0;
 	uint8_t j2_code = 0;
 	void *ttls = NULL;
 	char *user_prompt = NULL, *pass_prompt = NULL, *gtc_prompt = NULL, *signin_prompt = NULL;
@@ -1577,10 +1601,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 #if 0
 	/* Their client sends a lot of other stuff here, which we don't
 	 * understand and which doesn't appear to be mandatory. So leave
-	 * it out for now until/unless it becomes necessary. It seems that
-	 * sending Pulse-Secure/4.0.0.0 or anything newer makes it do
-	 * EAP-TLS *within* the EAP-TTLS session if you don't actually
-	 * present a certificate. */
+	 * it out for now until/unless it becomes necessary. */
 	buf_append_avp_be32(reqbuf, 0xd49, 3);
 	buf_append_avp_be32(reqbuf, 0xd61, 0);
 	buf_append_avp_string(reqbuf, 0xd5e, "Windows");
@@ -1591,7 +1612,26 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	buf_append_avp_string(reqbuf, 0xd6c, "\x02\xe9\xa7\x51\x92\x4e");
 	buf_append_avp_be32(reqbuf, 0xd84, 0);
 #else
-	buf_append_avp_string(reqbuf, 0xd70, vpninfo->useragent);
+	/* XX: "Only the Pulse client supports IPv6", both according to user reports and
+	 * https://help.ivanti.com/ps/help/en_US/PCS/9.1R14/ag/network_n_host_admin.htm#network_and_host_administration_1399867268_681155
+	 *
+	 * Therefore, unless IPv6 is explicitly disabled, we need to spoof
+	 * a "Pulse-Secure/" version string here. Only use the user-provided
+	 * UA string as is if it already matches this format.
+	 *
+	 * A certain minimum client version is apparently required to trigger the sending
+	 * of this flag as well. No official docs have been found, but 22.2.1.1295 works
+	 * (see https://gitlab.com/openconnect/openconnect/-/issues/506#note_1146848739).
+	 */
+	if (vpninfo->disable_ipv6 || !strncmp(vpninfo->useragent, "Pulse-Secure/", 13))
+		buf_append_avp_string(reqbuf, 0xd70, vpninfo->useragent);
+	else {
+		char *pulse_version;
+		if (asprintf(&pulse_version, "Pulse-Secure/22.2.1.1295 (%s)", vpninfo->useragent) < 0)
+			return -ENOMEM;
+		buf_append_avp_string(reqbuf, 0xd70, pulse_version);
+		free(pulse_version);
+	}
 #endif
 	if (vpninfo->cookie)
 		buf_append_avp_string(reqbuf, 0xd53, vpninfo->cookie);
@@ -1612,7 +1652,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	else
 		prompt_flags &= ~PROMPT_GTC_NEXT;
 
-	realm_entry = realms_found = j2_found = old_sessions = 0, gtc_found = 0;
+	realm_entry = realms_found = j2_found = old_sessions = 0, gtc_found = 0, regions_found = 0;
 	eap = recv_eap_packet(vpninfo, ttls, (void *)bytes, sizeof(bytes));
 	if (!eap) {
 		ret = -EIO;
@@ -1712,6 +1752,8 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 			realms_found++;
 		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd4f) {
 			realm_entry++;
+		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd51) {
+			regions_found++;
 		} else if (avp_vendor == VENDOR_JUNIPER2 && avp_code == 0xd5c) {
 			if (avp_len != 4)
 				goto auth_unknown;
@@ -1788,7 +1830,24 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 					goto auth_unknown;
 				}
 			} else {
-				goto auth_unknown;
+				uint32_t eaptype = (unsigned char)avp_c[4];
+
+				if (eaptype == EAP_TYPE_EXPANDED && avp_len >= 8)
+					eaptype = load_be32(avp_c + 4);
+
+				if (eaptype == EAP_TYPE_TLS && !vpninfo->certinfo[0].cert)
+					vpn_progress(vpninfo, PRG_ERR,
+						     _("Pulse server is trying to authenticate via EAP-TLS over EAP-TTLS, which we\n"
+						       "do not know how to handle. This can happen when the server OPTIONALLY accepts\n"
+						       "TLS client certificates, but your authentication does not require one.\n"
+						       "You may be able to work around it by spoofing a very old Pulse client with:\n"
+						       "        --useragent=\"Pulse-Secure/3.0.0\"\n"
+						       "Please report results to <%s>.\n"),
+						     "openconnect-devel@lists.infradead.org");
+				else
+					vpn_progress(vpninfo, PRG_ERR,
+						     _("Pulse server requested unexpected EAP type 0x%x\n"), eaptype);
+				goto bad_eap;
 			}
 
 		} else if (avp_flags & AVP_MANDATORY)
@@ -1796,7 +1855,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	}
 
 	/* We want it to be precisely one type of request, not a mixture. */
-	if (realm_entry + !!realms_found + j2_found + gtc_found + cookie_found + !!old_sessions != 1 &&
+	if (realm_entry + !!realms_found + !!regions_found + j2_found + gtc_found + cookie_found + !!old_sessions != 1 &&
 	    !signin_prompt) {
 	auth_unknown:
 		vpn_progress(vpninfo, PRG_ERR,
@@ -1830,7 +1889,13 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 		} else if (realms_found) {
 			vpn_progress(vpninfo, PRG_TRACE, _("Pulse realm choice\n"));
 
-			ret = pulse_request_realm_choice(vpninfo, reqbuf, realms_found, eap);
+			ret = pulse_request_realm_choice(vpninfo, reqbuf, realms_found, eap, 0);
+			if (ret)
+				goto out;
+		} else if (regions_found) {
+			vpn_progress(vpninfo, PRG_TRACE, _("Pulse region choice\n"));
+
+			ret = pulse_request_realm_choice(vpninfo, reqbuf, regions_found, eap, 1);
 			if (ret)
 				goto out;
 		} else if (j2_found) {
@@ -2302,30 +2367,80 @@ static int handle_main_config_packet(struct openconnect_info *vpninfo,
 		free_split_routes(&new_ip_info);
 		return -EINVAL;
 	}
-
-	/* On Pulse 9.1R14, we see packet type 0x2e20f0000, whereas earlier
-	 * versions had 0x2c20f0000.
+	/* On Pulse 9.1R14 and 9.1R16, we see packet type 0x2e20f000, whereas
+	 * earlier versions had 0x2c20f000.
 	 * With the newer packet type, we seem to have a leading set of
-	 * attribute elements. Example:
-	 *     2c 00           (fixed)
-	 *     00 0d           (length 13)
-	 *     03 00 00 00     (fixed)
-	 *     40 25 00 01 01  (unknown attr 0x4025, length 1, value 0x01)
-	*/
-	if (bytes[0x20] == 0x2e) {
-		/* Length of attributes section */
-		int attr_len = load_be16(bytes + 0x2e);
+	 * attribute elements.
+	 *
+	 * Example from earlier versions, starting at bytes+0x2c:
+	 *     2e 00           <start of routing information>
+	 *
+	 * Example from R14, starting at bytes+0x2c:
+	 *     2c 00           (fixed)                                      \
+	 *     00 0d                                             (length 13) |
+	 *     03 00 00 00     (fixed)                                       |
+	 *     40 25 00 01 01  (unknown attr 0x4025, length 1, value 0x01)  /
+	 *     2e 00           <start of routing information>
+	 *
+	 * Example from R16, starting at bytes+0x2c:
+	 *
+	 *     2e 00            (fixed)                                      \
+	 *     00 0d                                              (length 13) |
+	 *     03 00 00 00      (fixed)                                       |
+	 *     40 25 00 01 01   (unknown attr 0x4026, length 1, value 0x01)  /
+	 *     2c 00            (fixed)                                      \
+	 *     00 0d	                                          (length 13) |
+	 *     03 00 00 00      (fixed)                                       |
+	 *     40 26 00 01 01   (unknown attr 0x4025, length 1, value 0x01)  /
+	 *     2e 00            <start of routing information>
+	 */
+	if (load_be32(bytes + 0x20) == 0x2e20f000) {
+		int attr_flag;
+		int attr_len;
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("Processing Pulse main config packet for server version >= 9.1R14\n"));
+		do {
+			if (len < offset + 4)
+				goto bad_config;
 
-		/* Start of attributes */
-		if (load_be16(bytes + 0x2c) != 0x2c00 ||
-		    len < 0x2c + attr_len + 4 ||
-		    /* Process the attributes */
-		    handle_attr_elements(vpninfo, bytes + 0x2c, attr_len,
-					 &new_opts, &new_ip_info) < 0) {
-			goto bad_config;
-		}
-		offset += attr_len;
-	}
+			/* Start of attributes */
+			attr_flag = load_be16(bytes + offset);
+			attr_len = load_be16(bytes + offset + 2);
+
+			switch (attr_flag) {
+			case 0x2c00:
+				vpn_progress(vpninfo, PRG_TRACE,
+					     _("attr_flag 0x2c00: known for Pulse version >= 9.1R14\n"));
+				break;
+			case 0x2e00:
+				vpn_progress(vpninfo, PRG_TRACE,
+					     _("attr_flag 0x2e00: known for Pulse version >= 9.1R16\n"));
+				break;
+			default:
+				vpn_progress(vpninfo, PRG_ERR,
+					     _("attr_flag 0x%04x: unknown Pulse version. Please report to <%s>\n"),
+					     attr_flag, "openconnect-devel@lists.infradead.org");
+			}
+
+			if (len < offset + attr_len ||
+			    /* Process the attributes, even though all the attrs that
+			     * we have ever seen in this section are unknown, and will
+			     * be logged and otherwise ignored. */
+			    handle_attr_elements(vpninfo, bytes + offset, attr_len,
+						 &new_opts, &new_ip_info) < 0) {
+				goto bad_config;
+			}
+			offset += attr_len;
+		} while (attr_flag != 0x2c00);
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("If any of the above attributes are meaningful, please report to <%s>\n"),
+			     "openconnect-devel@lists.infradead.org");
+
+	} else if (load_be32(bytes + 0x20) == 0x2c20f000)
+		vpn_progress(vpninfo, PRG_TRACE,
+			     _("Processing Pulse main config packet for server version < 9.1R14\n"));
+	else
+		goto bad_config;
 
 	/* First part of header, similar to ESP, has already been checked */
 	if (len < offset + 5 ||
@@ -2337,6 +2452,7 @@ static int handle_main_config_packet(struct openconnect_info *vpninfo,
 	    len < offset + routes_len + 4 ||
 	    /* Another length field, must match to end of packet */
 	    load_be32(bytes + offset + routes_len) + routes_len + offset != len) {
+		goto bad_config;
 	}
 	p = bytes + offset + 8;
 	routes_len -= 8; /* The header including length and number of routes */
@@ -2443,6 +2559,8 @@ static int handle_esp_config_packet(struct openconnect_info *vpninfo,
 	uint32_t spi;
 	int ret;
 
+	vpn_progress(vpninfo, PRG_TRACE,
+		     _("Processing Pulse ESP config packet\n"));
 	if (len < 0x6a ||
 	    load_be32(bytes + 0x2c) != len - 0x2c ||
 	    load_be32(bytes + 0x30) != 0x01000000 ||
@@ -2541,9 +2659,9 @@ int pulse_connect(struct openconnect_info *vpninfo)
 		}
 
 		if (load_be32(bytes) != VENDOR_JUNIPER) {
-		bad_pkt:
 			vpn_progress(vpninfo, PRG_INFO,
-				     _("Unexpected IF-T/TLS packet when expecting configuration.\n"));
+				     _("Unexpected IF-T/TLS packet when expecting configuration: wrong vendor\n"));
+		bad_pkt:
 			dump_buf_hex(vpninfo, PRG_DEBUG, '<', bytes, ret);
 			continue;
 		}
@@ -2564,11 +2682,29 @@ int pulse_connect(struct openconnect_info *vpninfo)
 		 * < 0020: 2c 20 f0 00 00 00 00 00  00 00 01 70 ...          |, .........|
 		 */
 
-		if (pkt_type != 1 || ret < 0x2c || load_be32(bytes +  0x10) ||
-		    load_be32(bytes + 0x14) || load_be32(bytes + 0x18) ||
-		    load_be32(bytes + 0x1c) || load_be32(bytes + 0x24) ||
-		    load_be32(bytes + 0x28) != ret - 0x10)
+		if (pkt_type != 1) {
+			vpn_progress(vpninfo, PRG_INFO,
+				     _("Unexpected Pulse configuration packet: %s\n"),
+				     _("wrong type field (!= 1)"));
 			goto bad_pkt;
+		} else if (ret < 0x2c) {
+			vpn_progress(vpninfo, PRG_INFO,
+				     _("Unexpected Pulse configuration packet: %s\n"),
+				     _("too short"));
+			goto bad_pkt;
+		} else if (load_be32(bytes + 0x10) || load_be32(bytes + 0x14) ||
+			   load_be32(bytes + 0x18) || load_be32(bytes + 0x1c) ||
+			   load_be32(bytes + 0x24)) {
+			vpn_progress(vpninfo, PRG_INFO,
+				     _("Unexpected Pulse configuration packet: %s\n"),
+				     _("non-zero values at offsets 0x10, 0x14, 0x18, 0x1c, or 0x24"));
+			goto bad_pkt;
+		} else if (load_be32(bytes + 0x28) != ret - 0x10) {
+			vpn_progress(vpninfo, PRG_INFO,
+				     _("Unexpected Pulse configuration packet: %s\n"),
+				     _("length at offset 0x28 != packet length - 0x10"));
+			goto bad_pkt;
+		}
 
 		switch(load_be32(bytes + 0x20)) {
 		case 0x2c20f000:
@@ -2603,6 +2739,9 @@ int pulse_connect(struct openconnect_info *vpninfo)
 			break;
 
 		default:
+			vpn_progress(vpninfo, PRG_INFO,
+				     _("Unexpected Pulse configuration packet: %s\n"),
+				     _("identifier at offset 0x20 is unknown"));
 			goto bad_pkt;
 		}
 	}
@@ -2716,7 +2855,7 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 			    load_be16(pkt->data + 0x28) != 0x40)
 				goto unknown_pkt;
 
-			dump_buf_hex(vpninfo, PRG_ERR, '<', (void *)&vpninfo->cstp_pkt->pulse.vendor, len);
+			dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)&vpninfo->cstp_pkt->pulse.vendor, len);
 
 			ret = handle_esp_config_packet(vpninfo, (void *)&pkt->pulse.vendor, len);
 			if (ret) {
@@ -2768,7 +2907,9 @@ int pulse_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		default:
 		unknown_pkt:
 			vpn_progress(vpninfo, PRG_ERR,
-				     _("Unknown Pulse packet\n"));
+				     _("Unknown Pulse packet of %d bytes (vendor 0x%03x, type 0x%02x, hdr_len %d, ident %d)\n"),
+				     len, load_be32(&pkt->pulse.vendor), load_be32(&pkt->pulse.type),
+				     load_be32(&pkt->pulse.len), load_be32(&pkt->pulse.ident));
 			dump_buf_hex(vpninfo, PRG_TRACE, '<', (void *)&vpninfo->cstp_pkt->pulse.vendor, len);
 			continue;
 		}

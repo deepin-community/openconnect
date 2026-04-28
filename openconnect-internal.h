@@ -38,12 +38,6 @@
 #if defined(OPENCONNECT_OPENSSL)
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-/* Ick */
-#if OPENSSL_VERSION_NUMBER >= 0x00909000L
-#define method_const const
-#else
-#define method_const
-#endif
 #endif
 
 #if defined(OPENCONNECT_GNUTLS)
@@ -100,10 +94,10 @@
 #ifndef _Ret_bytecount_
 #define _Ret_bytecount_(sz)
 #endif
-#ifndef _Post_maybenull_
-#define _Post_maybenull_
-#endif
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
 #include "wintun.h"
+#pragma GCC diagnostic pop
 
 #include <ws2tcpip.h>
 #ifndef SECURITY_WIN32
@@ -128,9 +122,15 @@
 #include <errno.h>
 
 #ifdef HAVE_POSIX_SPAWN
-#ifdef __APPLE__
+#if defined(__APPLE__)
 #include <crt_externs.h>
 #define environ (*_NSGetEnviron())
+#else
+/*
+ * POSIX.1-2017 says that environ must be declared by the user if it is to be used directly:
+ * https://pubs.opengroup.org/onlinepubs/9699919799/functions/exec.html
+ */
+extern char **environ;
 #endif
 #include <spawn.h>
 #endif
@@ -440,6 +440,9 @@ struct openconnect_info {
 	int esp_magic_af;
 	unsigned char esp_magic[16]; /* GlobalProtect magic ping address (network-endian) */
 
+	int pulse_esp_unstupid;      /* See pulse.c and esp.c for the stupid protocol-layering malpractice
+				      * that Pulse requires, unless this flag is set by the server. */
+
 	struct oc_ppp *ppp;
 	struct oc_text_buf *ppp_tls_connect_req;
 	struct oc_text_buf *ppp_dtls_connect_req;
@@ -477,6 +480,8 @@ struct openconnect_info {
 	int try_http_auth;
 	struct http_auth_state http_auth[MAX_AUTH_TYPES];
 	struct http_auth_state proxy_auth[MAX_AUTH_TYPES];
+	int no_external_auth;
+	const char *external_browser;
 
 	char *localname;
 
@@ -488,8 +493,16 @@ struct openconnect_info {
 				* DNS lookup. We do this so that we can be
 				* sure we reconnect to the same server we
 				* authenticated to. */
+
 	int port;
 	char *urlpath;
+
+	char *sni; /* This is the hostname that we present as the TLS
+		    * Server Name Indication, unencrypted in the TLS handshake,
+		    * in place of the true/original hostname. This is useful
+		    * for Domain Fronting, by which some filtered or censored
+		    * Internet connections can be bypassed.
+		    */
 
 	/* The application might ask us to recreate a connection URL,
 	 * and we own the string so cache it for later freeing. */
@@ -630,6 +643,7 @@ struct openconnect_info {
 	int reconnect_timeout;
 	int reconnect_interval;
 	int dtls_attempt_period;
+	int udp_probes_sent;
 	time_t auth_expiration;
 	time_t new_dtls_started;
 #if defined(OPENCONNECT_OPENSSL)
@@ -1168,8 +1182,9 @@ int dumb_socketpair(OPENCONNECT_CMD_SOCKET socks[2], int make_overlapped);
 /* I always coded as if it worked like this. Now it does. */
 #define realloc_inplace(p, size) do {			\
 	void *__realloc_old = p;			\
-	p = realloc(p, size);				\
-	if (size && !p)					\
+	size_t sz = size;				\
+	p = realloc(p, sz);				\
+	if (sz && !p)					\
 		free(__realloc_old);			\
     } while (0)
 
@@ -1483,7 +1498,7 @@ int generate_strap_keys(struct openconnect_info *vpninfo);
 int ecdh_compute_secp256r1(struct openconnect_info *vpninfo, const unsigned char *pubkey,
 			   int pubkey_len, unsigned char *secret);
 int hkdf_sha256_extract_expand(struct openconnect_info *vpninfo, unsigned char *buf,
-			       const char *info, int infolen);
+			       const unsigned char *info, int infolen);
 int aes_256_gcm_decrypt(struct openconnect_info *vpninfo, unsigned char *key,
 			unsigned char *data, int len,
 			unsigned char *iv, unsigned char *tag);
@@ -1551,6 +1566,8 @@ int xmlnode_is_named(xmlNode *xml_node, const char *name);
 int xmlnode_get_val(xmlNode *xml_node, const char *name, char **var);
 int xmlnode_get_prop(xmlNode *xml_node, const char *name, char **var);
 int xmlnode_match_prop(xmlNode *xml_node, const char *name, const char *match);
+int xmlnode_get_trimmed_val(xmlNode *xml_node, const char *name, char **var);
+int xmlnode_bool_or_int_value(xmlNode *node);
 int append_opt(struct oc_text_buf *body, const char *opt, const char *name);
 int append_form_opts(struct openconnect_info *vpninfo,
 		     struct oc_auth_form *form, struct oc_text_buf *body);
