@@ -1,19 +1,75 @@
-openconnect (9.01-2deepin1) unstable; urgency=medium
+openconnect (9.12-3+deb13u2) trixie; urgency=medium
 
-  [ Mike Miller ]
-  * update
+  * Non-maintainer upload.
+  * use the unsigned printf qualifier for size_t : fixes MinGW{32,64} build
+  * Use RFC9266 'tls-exporter' channel bindings for Cisco STRAP with TLSv1.3
+    (Closes: #1099497)
 
-  [ lichenggang ]
-  * Rebuild against new tpm2-tss version
+ -- Salvatore Bonaccorso <carnil@debian.org>  Fri, 02 Jan 2026 10:12:05 +0100
 
- -- lichenggang <lichenggang@deepin.org>  Tue, 28 Apr 2026 17:40:58 +0800
+openconnect (9.12-3+deb13u1) trixie; urgency=medium
+
+  * Non-maintainer upload.
+  [ Luca Boccassi ]
+  * d/copyright: update Upstream-Contact to mailing list
+
+  [ Lee Garrett ]
+  * Patch: Respect path in AnyConnect/OpenConnect XML form handling (Closes: #1119239)
+  * Update debian/gbp.conf to match debian/trixie branch
+
+ -- Lee Garrett <debian@rocketjump.eu>  Tue, 28 Oct 2025 21:47:04 +0100
+
+openconnect (9.12-3) unstable; urgency=medium
+
+  * Disable autopkgtest and remove test build dependencies (Closes:
+    #1075772)
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 04 Aug 2024 13:24:52 +0100
+
+openconnect (9.12-2) unstable; urgency=medium
+
+  [ Samuel Thibault ]
+  * d/control: Generalize hurd-i386 into hurd-any.
+
+  [ Luca Boccassi ]
+  * Enable ELF metadata stamping
+  * Switch from pkg-config to pkgconf
+  * d/control: bump Standards-Version to 4.7.0, no changes
+  * Remove build-depends on uid-wrapper and socket-wrapper to avoid
+    autoremoval
+  * Drop build dependnecy on libgcrypt-20-dev, not needed (Closes:
+    #1071946)
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 01 Jun 2024 12:14:22 +0100
+
+openconnect (9.12-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/9.12'
+    For a full list of changes see the upstream changelog at:
+    https://www.infradead.org/openconnect/changelog.html
+  * Drop all patches, merged upstream
+  * Update symbols file
+
+ -- Luca Boccassi <bluca@debian.org>  Tue, 13 Jun 2023 23:41:20 +0100
+
+openconnect (9.01-3) unstable; urgency=medium
+
+  * Bump Standards-Version to 4.6.2, no changes
+  * Backport patch to fix connection to Pulse server v9.1R16 (Closes:
+    #1031906)
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 25 Feb 2023 18:46:29 +0000
 
 openconnect (9.01-2) unstable; urgency=medium
 
-  [ Luca Boccassi ]
-  * UNRELEASED
+  * Backport patch to fix SSO with anyconnect v2
+    (Closes: #1025961) (LP: #1993901)
+  * Add Build-Depends and Suggests on xdg-utils for embedded SSO
+    (Closes: #1025961)
+  * Bump Standards-Version to 4.6.1, no changes
+  * Drop ancient NEWS file
 
- -- caixiangrong <caixiangrong@uniontech.com>  Mon, 25 Jul 2022 13:49:18 +0800
+ -- Luca Boccassi <bluca@debian.org>  Thu, 15 Dec 2022 01:17:36 +0000
 
 openconnect (9.01-1) unstable; urgency=medium
 

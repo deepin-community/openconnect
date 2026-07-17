@@ -93,6 +93,9 @@
 /* Have IPV6_PATHMTU socket option */
 #undef HAVE_IPV6_PATHMTU
 
+/* Have builtin json-parser package */
+#undef HAVE_JSON
+
 /* Define to 1 if you have the `log' library (-llog). */
 #undef HAVE_LIBLOG
 
@@ -126,9 +129,6 @@
 /* From LZ4 r129 */
 #undef HAVE_LZ4_COMPRESS_DEFAULT
 
-/* Define to 1 if you have the <memory.h> header file. */
-#undef HAVE_MEMORY_H
-
 /* Have memset_s() function */
 #undef HAVE_MEMSET_S
 
@@ -158,6 +158,9 @@
 
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
+
+/* Define to 1 if you have the <stdio.h> header file. */
+#undef HAVE_STDIO_H
 
 /* Define to 1 if you have the <stdlib.h> header file. */
 #undef HAVE_STDLIB_H
@@ -252,7 +255,9 @@
 /* Define to the version of this package. */
 #undef PACKAGE_VERSION
 
-/* Define to 1 if you have the ANSI C header files. */
+/* Define to 1 if all of the C90 standard headers exist (not just the ones
+   required in a freestanding environment). This macro is provided for
+   backward compatibility; new code need not use it. */
 #undef STDC_HEADERS
 
 /* Version number of package */

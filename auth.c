@@ -227,9 +227,12 @@ static int parse_form(struct openconnect_info *vpninfo, struct oc_auth_form *for
 			continue;
 		}
 		input_label = (char *)xmlGetProp(xml_node, (unsigned char *)"label");
+		if (!input_label && asprintf(&input_label, "%s:", input_name) == -1)
+			goto nomem;
 
 		opt = calloc(1, sizeof(*opt));
 		if (!opt) {
+		nomem:
 			free(input_type);
 			free(input_name);
 			free(input_label);
@@ -603,7 +606,7 @@ static int parse_xml_response(struct openconnect_info *vpninfo,
 	form = calloc(1, sizeof(*form));
 	if (!form)
 		return -ENOMEM;
-	xml_doc = xmlReadMemory(response, strlen(response), "noname.xml", NULL,
+	xml_doc = xmlReadMemory(response, strlen(response), NULL, NULL,
 				XML_PARSE_NOERROR|XML_PARSE_RECOVER);
 	if (!xml_doc) {
 		vpn_progress(vpninfo, PRG_ERR,
@@ -849,19 +852,17 @@ static xmlDocPtr xmlpost_new_query(struct openconnect_info *vpninfo, const char 
 	if (!capabilities)
 		goto bad;
 
-	node = xmlNewTextChild(capabilities, NULL, XCAST("auth-method"), XCAST("single-sign-on"));
-	if (!node)
-		goto bad;
-
-	node = xmlNewTextChild(capabilities, NULL, XCAST("auth-method"), XCAST("single-sign-on-v2"));
-	if (!node)
-		goto bad;
+	if (!vpninfo->no_external_auth) {
+		node = xmlNewTextChild(capabilities, NULL, XCAST("auth-method"), XCAST("single-sign-on-v2"));
+		if (!node)
+			goto bad;
 
 #ifdef HAVE_HPKE_SUPPORT
-	node = xmlNewTextChild(capabilities, NULL, XCAST("auth-method"), XCAST("single-sign-on-external-browser"));
-	if (!node)
-		goto bad;
+		node = xmlNewTextChild(capabilities, NULL, XCAST("auth-method"), XCAST("single-sign-on-external-browser"));
+		if (!node)
+			goto bad;
 #endif
+	}
 
 	if (vpninfo->certinfo[1].cert) {
 		node = xmlNewTextChild(capabilities, NULL, XCAST("auth-method"), XCAST("multiple-cert"));
@@ -1658,7 +1659,7 @@ newgroup:
 
 	struct oc_text_buf *cookie_buf = buf_alloc();
 #ifdef HAVE_HPKE_SUPPORT
-	if (vpninfo->strap_key) {
+	if (!vpninfo->no_external_auth && vpninfo->strap_key) {
 		buf_append(cookie_buf, "openconnect_strapkey=");
 		append_strap_privkey(vpninfo, cookie_buf);
 		buf_append(cookie_buf, "; webvpn=");

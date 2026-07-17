@@ -102,11 +102,6 @@ static int process_attr(struct openconnect_info *vpninfo,
 		vpn_progress(vpninfo, PRG_DEBUG, _("Received DNS search domain %.*s\n"),
 			     attrlen, (char *)data);
 		new_ip_info->domain = add_option_dup(new_opts, "search", (char *)data, attrlen);
-		if (new_ip_info->domain) {
-			char *p = (char *)new_ip_info->domain;
-			while ((p = strchr(p, ',')))
-				*p = ' ';
-		}
 		break;
 
 	case GRP_ATTR(1, 1):
@@ -348,7 +343,6 @@ static const unsigned char esp_kmp_part2[] = {
 	0x00, 0x02, 0x00, 0x00, 0x00, 0x40, /* Attr 2 (secrets) */
 };
 /* And now 0x40 bytes of random secret for encryption and HMAC key */
-#endif
 
 static const struct pkt esp_enable_pkt = {
 	.next = NULL,
@@ -380,6 +374,7 @@ static int queue_esp_control(struct openconnect_info *vpninfo, int enable)
 	queue_packet(&vpninfo->tcp_control_queue, new);
 	return 0;
 }
+#endif /* HAVE_ESP */
 
 static int check_kmp_header(struct openconnect_info *vpninfo, unsigned char *bytes, int pktlen)
 {
@@ -588,15 +583,22 @@ int oncp_connect(struct openconnect_info *vpninfo)
 	 */
 	if (check_len == 1) {
 		len = vpninfo->ssl_read(vpninfo, (void *)bytes, sizeof(bytes));
+		if (len < 0) {
+			ret = len;
+			goto out;
+		}
 		check_len = load_le16(bytes);
 	} else {
-		len = vpninfo->ssl_read(vpninfo, (void *)(bytes+2), sizeof(bytes)-2) + 2;
+		len = vpninfo->ssl_read(vpninfo, (void *)(bytes+2), sizeof(bytes)-2);
+		if (len < 0) {
+			ret = len;
+			goto out;
+		}
+		len += 2;
 		check_len--;
 	}
-	if (len < 0) {
-		ret = len;
-		goto out;
-	}
+	/* Now there is a record of size 'check_len', of which we have the
+	 * first (len-2) bytes starting at bytes[2]. */
 	vpn_progress(vpninfo, PRG_TRACE,
 		     _("Read %d bytes of SSL record\n"), len);
 
@@ -608,7 +610,10 @@ int oncp_connect(struct openconnect_info *vpninfo)
 		goto out;
 	}
 
-	ret = check_kmp_header(vpninfo, bytes + 2, len);
+	if (vpninfo->dump_http_traffic)
+		dump_buf_hex(vpninfo, PRG_TRACE, '<', bytes + 2, len - 2);
+
+	ret = check_kmp_header(vpninfo, bytes + 2, len - 2);
 	if (ret < 0)
 		goto out;
 
@@ -631,6 +636,7 @@ int oncp_connect(struct openconnect_info *vpninfo)
 	}
 	vpn_progress(vpninfo, PRG_TRACE,
 		     _("Got KMP message 301 of length %d\n"), kmplen);
+
 	while (kmplen + 22 > len) {
 		char l[2];
 		int thislen;
@@ -657,9 +663,42 @@ int oncp_connect(struct openconnect_info *vpninfo)
 			ret = -EINVAL;
 			goto out;
 		}
+
+		/*
+		 * Sometimes the server throws IP packets into the *middle* of the config!
+		 * https://gitlab.com/openconnect/openconnect/-/issues/562#note_1357470906
+		 *
+		 * We can't use check_kmp_header() because the byte after the KMP type is
+		 * 0x00 not 0x01 which kmp_tail expects. So we do the check manually...
+		 *
+		 * This check may have false positives, if this genuinely *is* the end of
+		 * the config packet but just happens to *look* like KMP300 with a Legacy
+		 * IP packet in it. And false negatives, if there's more than one KMP300
+		 * in the SSL record — which we know *can* happen later. We also know that
+		 * KMP300s can be split across multiple records. So if we get this, then
+		 * another record which doesn't have a KMP header... how are we even
+		 * supposed to guess which one that next record is supposed to complete?
+		 *
+		 * We *could* collect all the frames into a list and then each time we
+		 * get a new frame, attempt to find a set of frames which add up to the
+		 * correct size and see if they parse sanely. But let's try this for now.
+		 */
+		if (thislen >= 21 && !memcmp(bytes + len, kmp_head, sizeof(kmp_head)) &&
+		    !bytes[len + 8] && !memcmp(bytes + len + 9, kmp_tail + 1, sizeof(kmp_tail) - 1) &&
+		    load_be16(bytes + len + 6) == 300 && load_be16(bytes + len + 18) + 20 == thislen &&
+		    bytes[len + 20] == 0x45 /* Only Legacy IP over oNCP anyway */) {
+			vpn_progress(vpninfo, PRG_INFO,
+				     _("Discarding Legacy IP frame in the middle of oNCP config\n"));
+			continue;
+		}
+
 		vpn_progress(vpninfo, PRG_TRACE,
 			     _("Read additional %d bytes of KMP 301 message\n"),
 			     thislen);
+
+		if (vpninfo->dump_http_traffic)
+			dump_buf_hex(vpninfo, PRG_TRACE, '<', bytes + len, thislen);
+
 		len += thislen;
 	}
 
@@ -1085,6 +1124,7 @@ int oncp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		if (vpninfo->current_ssl_pkt == vpninfo->deflate_pkt) {
 			free_pkt(vpninfo, vpninfo->pending_deflated_pkt);
 			vpninfo->pending_deflated_pkt = NULL;
+#ifdef HAVE_ESP
 		} else if (vpninfo->current_ssl_pkt == &esp_enable_pkt) {
 			/* Only set the ESP state to connected and actually start
 			   sending packets on it once the enable message has been
@@ -1093,6 +1133,7 @@ int oncp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 				     _("Sent ESP enable control packet\n"));
 			vpninfo->dtls_state = DTLS_ESTABLISHED;
 			work_done = 1;
+#endif /* HAVE_ESP */
 		} else {
 			free_pkt(vpninfo, vpninfo->current_ssl_pkt);
 		}
@@ -1169,6 +1210,7 @@ int oncp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		;
 	}
 #endif
+#ifdef HAVE_ESP
 	/* Queue the ESP enable message. We will start sending packets
 	 * via ESP once the enable message has been *sent* over the
 	 * TCP channel. Assign it directly to current_ssl_pkt so that
@@ -1177,6 +1219,7 @@ int oncp_mainloop(struct openconnect_info *vpninfo, int *timeout, int readable)
 		vpninfo->current_ssl_pkt = (struct pkt *)&esp_enable_pkt;
 		goto handle_outgoing;
 	}
+#endif /* HAVE_ESP */
 
 	vpninfo->current_ssl_pkt = dequeue_packet(&vpninfo->tcp_control_queue);
 	if (vpninfo->current_ssl_pkt)
@@ -1242,7 +1285,7 @@ void oncp_esp_close(struct openconnect_info *vpninfo)
 int oncp_esp_send_probes(struct openconnect_info *vpninfo)
 {
 	struct pkt *pkt;
-	int pktlen, seq;
+	int pktlen;
 
 	if (vpninfo->dtls_fd == -1) {
 		int fd = udp_connect(vpninfo);
@@ -1261,18 +1304,15 @@ int oncp_esp_send_probes(struct openconnect_info *vpninfo)
 	if (!pkt)
 		return -ENOMEM;
 
-	for (seq=1; seq <= (vpninfo->dtls_state==DTLS_ESTABLISHED ? 1 : 2); seq++) {
-		pkt->len = 1;
-		pkt->data[0] = 0;
-		pktlen = construct_esp_packet(vpninfo, pkt,
-					      vpninfo->dtls_addr->sa_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IPIP);
-		if (pktlen < 0 ||
-		    send(vpninfo->dtls_fd, (void *)&pkt->esp, pktlen, 0) < 0)
-			vpn_progress(vpninfo, PRG_DEBUG, _("Failed to send ESP probe\n"));
-	}
-	free_pkt(vpninfo, pkt);
+	pkt->len = 1;
+	pkt->data[0] = 0;
+	pktlen = construct_esp_packet(vpninfo, pkt,
+				      vpninfo->dtls_addr->sa_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IPIP);
+	if (pktlen < 0 ||
+	    send(vpninfo->dtls_fd, (void *)&pkt->esp, pktlen, 0) < 0)
+		vpn_progress(vpninfo, PRG_DEBUG, _("Failed to send ESP probe\n"));
 
-	vpninfo->dtls_times.last_tx = time(&vpninfo->new_dtls_started);
+	free_pkt(vpninfo, pkt);
 
 	return 0;
 };
