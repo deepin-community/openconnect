@@ -668,6 +668,11 @@ int handle_redirect(struct openconnect_info *vpninfo)
 		vpninfo->redirect_url = NULL;
 
 		return 0;
+	} else if (vpninfo->redirect_url[0] == '\0' || vpninfo->redirect_url[0] == '#') {
+		/* Empty redirect, no op */
+		free(vpninfo->redirect_url);
+		vpninfo->redirect_url = NULL;
+		return 0;
         } else if (vpninfo->redirect_url[0] == '/') {
                 /* Absolute redirect within same host */
                 free(vpninfo->urlpath);
@@ -968,6 +973,8 @@ int do_https_request(struct openconnect_info *vpninfo, const char *method, const
 			result = -EPERM;
 		else if (result == 512) /* GlobalProtect invalid username/password */
 			result = -EACCES;
+		else if (result == 405) /* Method not supported */
+			result = -EOPNOTSUPP;
 		else
 			result = -EINVAL;
 

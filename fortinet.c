@@ -97,11 +97,11 @@ static int filter_opts(struct oc_text_buf *buf, const char *query, const char *i
 
 int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 {
-	int ret;
+	int ret, ftmpush;
 	struct oc_text_buf *req_buf = NULL;
 	struct oc_auth_form *form = NULL;
 	struct oc_form_opt *opt, *opt2;
-	char *resp_buf = NULL, *realm = NULL, *tokeninfo_fields = NULL;
+	char *resp_buf = NULL, *realm = NULL, *tokeninfo_fields = NULL, *ti;
 
 	req_buf = buf_alloc();
 	if (buf_error(req_buf)) {
@@ -189,9 +189,17 @@ int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 			/* 2FA form (fields 'username', 'code', and a bunch of values
 			 * from the previous response which we mindlessly parrot back)
 			 */
-			buf_append(req_buf, "&code2=&%s", tokeninfo_fields);
-			free(tokeninfo_fields);
-			tokeninfo_fields = NULL;
+			buf_append(req_buf, "&%s", tokeninfo_fields);
+
+			/* But if the server sent 'tokeninfo=ftm_push' AND 'code' was left
+			 * blank, then we exclude 'magic' and add 'ftmpush=1', in order to
+			 * trigger the appropriate mobile-push-based response. */
+			if (ftmpush && (!opt2->_value || !opt2->_value[0])) {
+				char *magic = strstr(req_buf->data, "&magic=");
+				if (magic)
+					req_buf->pos = magic - req_buf->data;
+				buf_append(req_buf, "&ftmpush=1");
+			}
 		}
 
 		if ((ret = buf_error(req_buf)))
@@ -218,17 +226,17 @@ int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 
 		/* XX: We got 200 status, but no SVPNCOOKIE. tokeninfo-type 2FA? */
 		if (ret > 0 &&
-		    !strncmp(resp_buf, "ret=", 4) && strstr(resp_buf, ",tokeninfo=")) {
+		    !strncmp(resp_buf, "ret=", 4) && (ti = strstr(resp_buf, ",tokeninfo="))) {
 			const char *prompt;
 			struct oc_text_buf *tokeninfo_buf = buf_alloc();
+			ftmpush = !strncmp(ti + 11, "ftm_push", 8);
 
 			/* Hide 'username' field */
 			opt->type = OC_FORM_OPT_HIDDEN;
-			free(opt2->label);
-			free(opt2->_value);
-			opt2->label = opt2->_value = NULL;
 
 			/* Change 'credential' field to 'code'. */
+			free(opt2->label);
+			free(opt2->_value);
 			opt2->_value = NULL;
 			opt2->name = strdup("code");
 			opt2->label = strdup("Code: ");
@@ -242,7 +250,8 @@ int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 			if (!(form->auth_id = strdup("_challenge")))
 				goto nomem;
 
-			/* Save a bunch of values to parrot back */
+			/* Save a bunch of values to parrot back. 'magic' must be LAST
+			 * in order for the 'ftmpush' trick above to work. */
 			filter_opts(tokeninfo_buf, resp_buf, "reqid,polid,grp,portal,peer,magic", 1);
 			if ((ret = buf_error(tokeninfo_buf)))
 				goto out;
@@ -287,6 +296,11 @@ int fortinet_obtain_cookie(struct openconnect_info *vpninfo)
 				ret = -EINVAL;
 				goto out;
 			}
+		}
+		/* XX: We got "405 Method Not Allowed", which is strangely used to indicate invalid credentials */
+		else if (ret == -EOPNOTSUPP) {
+			free(form->message);
+			form->message = strdup(_("Invalid credentials; try again."));
 		}
 	}
 
@@ -396,7 +410,7 @@ static int parse_fortinet_xml_config(struct openconnect_info *vpninfo, char *buf
 	if (!buf || !len)
 		return -EINVAL;
 
-	xml_doc = xmlReadMemory(buf, len, "noname.xml", NULL,
+	xml_doc = xmlReadMemory(buf, len, NULL, NULL,
 				XML_PARSE_NOERROR|XML_PARSE_RECOVER);
 	if (!xml_doc) {
 		vpn_progress(vpninfo, PRG_ERR,
@@ -624,19 +638,13 @@ static int fortinet_configure(struct openconnect_info *vpninfo)
 		if (ret)
 			return ret;
 	}
-	for (svpncookie = vpninfo->cookies; svpncookie; svpncookie = svpncookie->next)
-		if (!strcmp(svpncookie->option, "SVPNCOOKIE"))
-			break;
-	if (!svpncookie) {
-		vpn_progress(vpninfo, PRG_ERR, _("No cookie named SVPNCOOKIE.\n"));
-		ret = -EINVAL;
-		goto out;
-	}
-
-	free(vpninfo->urlpath);
 
 	/* Fetch the connection options in XML format */
-	vpninfo->urlpath = strdup("remote/fortisslvpn_xml");
+	free(vpninfo->urlpath);
+	if (asprintf(&vpninfo->urlpath, "remote/fortisslvpn_xml%s", vpninfo->disable_ipv6 ? "" : "?dual_stack=1") < 0) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	ret = do_https_request(vpninfo, "GET", NULL, NULL, &res_buf, NULL, HTTP_NO_FLAGS);
 	if (ret < 0) {
 		if (ret == -EPERM) {
@@ -649,6 +657,7 @@ static int fortinet_configure(struct openconnect_info *vpninfo)
 			 * whether the SVPNCOOKIE is still valid/alive, until we are sure we've
 			 * worked out the weirdness with reconnects.
 			 */
+			free(vpninfo->urlpath);
 			vpninfo->urlpath = strdup("remote/fortisslvpn");
 			int ret2 = do_https_request(vpninfo, "GET", NULL, NULL, &res_buf, NULL, HTTP_NO_FLAGS);
 			if (ret2 > 0)
@@ -685,6 +694,7 @@ static int fortinet_configure(struct openconnect_info *vpninfo)
 	if (ret)
 		goto out;
 
+	/* Build TLS connection request (looks like HTTP GET, but acts as HTTP CONNECT) */
 	reqbuf = vpninfo->ppp_tls_connect_req;
 	if (!reqbuf)
 		reqbuf = buf_alloc();
@@ -701,10 +711,19 @@ static int fortinet_configure(struct openconnect_info *vpninfo)
 	vpninfo->ppp_tls_connect_req = reqbuf;
 	reqbuf = NULL;
 
+	/* Build DTLS connection request (bespoke Fortinet format) */
 	reqbuf = vpninfo->ppp_dtls_connect_req;
 	if (!reqbuf)
 		reqbuf = buf_alloc();
 	buf_truncate(reqbuf);
+	for (svpncookie = vpninfo->cookies; svpncookie; svpncookie = svpncookie->next)
+		if (!strcmp(svpncookie->option, "SVPNCOOKIE") && svpncookie->value)
+			break;
+	if (!svpncookie) {
+		vpn_progress(vpninfo, PRG_ERR, _("No cookie named SVPNCOOKIE.\n"));
+		ret = -EINVAL;
+		goto out;
+	}
 	buf_append_be16(reqbuf, 2 + sizeof(clthello) + strlen(svpncookie->value) + 1); /* length */
 	buf_append_bytes(reqbuf, clthello, sizeof(clthello));
 	buf_append(reqbuf, "%s%c", svpncookie->value, 0);

@@ -111,10 +111,11 @@ static int _openconnect_gnutls_write(gnutls_session_t ses, int fd, struct openco
 				FD_SET(fd, &rd_set);
 
 			cmd_fd_set(vpninfo, &rd_set, &maxfd);
-			if (select(maxfd + 1, &rd_set, &wr_set, NULL, NULL) < 0 &&
-			    errno != EINTR) {
-				vpn_perror(vpninfo, _("Failed select() for TLS"));
-				return -EIO;
+			while (select(maxfd + 1, &rd_set, &wr_set, NULL, NULL) < 0) {
+				if (errno != EINTR) {
+					vpn_perror(vpninfo, _("Failed select() for TLS"));
+					return -EIO;
+				}
 			}
 			if (is_cancel_pending(vpninfo, &rd_set)) {
 				vpn_progress(vpninfo, PRG_ERR, _("TLS/DTLS write cancelled\n"));
@@ -165,10 +166,11 @@ static int _openconnect_gnutls_read(gnutls_session_t ses, int fd, struct opencon
 				FD_SET(fd, &rd_set);
 
 			cmd_fd_set(vpninfo, &rd_set, &maxfd);
-			ret = select(maxfd + 1, &rd_set, &wr_set, NULL, tv);
-			if (ret < 0 && errno != EINTR) {
-				vpn_perror(vpninfo, _("Failed select() for TLS/DTLS"));
-				return -EIO;
+			while ((ret = select(maxfd + 1, &rd_set, &wr_set, NULL, tv)) < 0) {
+				if (errno != EINTR) {
+					vpn_perror(vpninfo, _("Failed select() for TLS/DTLS"));
+					return -EIO;
+				}
 			}
 
 			if (is_cancel_pending(vpninfo, &rd_set)) {
@@ -262,10 +264,11 @@ static int openconnect_gnutls_gets(struct openconnect_info *vpninfo, char *buf, 
 				FD_SET(vpninfo->ssl_fd, &rd_set);
 
 			cmd_fd_set(vpninfo, &rd_set, &maxfd);
-			if (select(maxfd + 1, &rd_set, &wr_set, NULL, NULL) < 0 &&
-			    errno != EINTR) {
-				vpn_perror(vpninfo, _("Failed select() for TLS"));
-				return -EIO;
+			while (select(maxfd + 1, &rd_set, &wr_set, NULL, NULL) < 0) {
+				if (errno != EINTR) {
+					vpn_perror(vpninfo, _("Failed select() for TLS"));
+					return -EIO;
+				}
 			}
 			if (is_cancel_pending(vpninfo, &rd_set)) {
 				vpn_progress(vpninfo, PRG_ERR, _("TLS/DTLS read cancelled\n"));
@@ -2062,6 +2065,64 @@ void openconnect_free_peer_cert_chain(struct openconnect_info *vpninfo,
 	free(chain);
 }
 
+/* Wrapper for gnutls_x509_crt_check_hostname, which additionally
+ * handles IP addresses:
+ *
+ * - Legacy IP or IPv6 literals (not handled by GnuTLS <3.3.6)
+ * - IPv6 literals in URI form with surrounding [] (not handled as-is by any version of GnuTLS)
+ */
+static int crt_check_hostname_or_ip(gnutls_x509_crt_t cert, char *hostname)
+{
+	int i, ret;
+	unsigned char addrbuf[sizeof(struct in6_addr)];
+	unsigned char certaddr[sizeof(struct in6_addr)];
+	size_t addrlen = 0, certaddrlen;
+
+	ret = gnutls_x509_crt_check_hostname(cert, hostname);
+	if (ret)
+		return ret;
+
+	/* gnutls_x509_crt_check_hostname() doesn't cope with IPv6 literals
+	   in URI form with surrounding [] so we must check for ourselves. */
+	if (hostname[0] == '[' &&
+	    hostname[strlen(hostname)-1] == ']') {
+		char *p = &hostname[strlen(hostname)-1];
+		*p = 0;
+		if (inet_pton(AF_INET6, hostname + 1, addrbuf) > 0)
+			addrlen = 16;
+		*p = ']';
+	}
+#if GNUTLS_VERSION_NUMBER < 0x030306
+	/* And before 3.3.6 it didn't check IP addresses at all. */
+	else if (inet_pton(AF_INET, hostname, addrbuf) > 0)
+		addrlen = 4;
+	else if (inet_pton(AF_INET6, hostname, addrbuf) > 0)
+		addrlen = 16;
+#endif
+
+	if (!addrlen) {
+		/* hostname was not a bare IP address. No match */
+		return 0;
+	}
+
+	for (i = 0; ; i++) {
+		certaddrlen = sizeof(certaddr);
+		ret = gnutls_x509_crt_get_subject_alt_name(cert, i, certaddr,
+							   &certaddrlen, NULL);
+		/* If this happens, it wasn't an IP address. */
+		if (ret == GNUTLS_E_SHORT_MEMORY_BUFFER)
+			continue;
+		if (ret < 0)
+			break;
+		if (ret != GNUTLS_SAN_IPADDRESS)
+			continue;
+		/* Matching IP address. Return success */
+		if (certaddrlen == addrlen && !memcmp(addrbuf, certaddr, addrlen))
+			return 1;
+	}
+	return 0;
+}
+
 static int verify_peer(gnutls_session_t session)
 {
 	struct openconnect_info *vpninfo = gnutls_session_get_ptr(session);
@@ -2142,52 +2203,11 @@ static int verify_peer(gnutls_session_t session)
 	if (reason)
 		goto done;
 
-	if (!gnutls_x509_crt_check_hostname(cert, vpninfo->hostname)) {
-		int i, ret;
-		unsigned char addrbuf[sizeof(struct in6_addr)];
-		unsigned char certaddr[sizeof(struct in6_addr)];
-		size_t addrlen = 0, certaddrlen;
-
-		/* gnutls_x509_crt_check_hostname() doesn't cope with IPv6 literals
-		   in URI form with surrounding [] so we must check for ourselves. */
-		if (vpninfo->hostname[0] == '[' &&
-		    vpninfo->hostname[strlen(vpninfo->hostname)-1] == ']') {
-			char *p = &vpninfo->hostname[strlen(vpninfo->hostname)-1];
-			*p = 0;
-			if (inet_pton(AF_INET6, vpninfo->hostname + 1, addrbuf) > 0)
-				addrlen = 16;
-			*p = ']';
-		}
-#if GNUTLS_VERSION_NUMBER < 0x030306
-		/* And before 3.3.6 it didn't check IP addresses at all. */
-		else if (inet_pton(AF_INET, vpninfo->hostname, addrbuf) > 0)
-			addrlen = 4;
-		else if (inet_pton(AF_INET6, vpninfo->hostname, addrbuf) > 0)
-			addrlen = 16;
-#endif
-
-		if (!addrlen) {
-			/* vpninfo->hostname was not a bare IP address. Nothing to do */
-			goto badhost;
-		}
-
-		for (i = 0; ; i++) {
-			certaddrlen = sizeof(certaddr);
-			ret = gnutls_x509_crt_get_subject_alt_name(cert, i, certaddr,
-								   &certaddrlen, NULL);
-			/* If this happens, it wasn't an IP address. */
-			if (ret == GNUTLS_E_SHORT_MEMORY_BUFFER)
-				continue;
-			if (ret < 0)
-				break;
-			if (ret != GNUTLS_SAN_IPADDRESS)
-				continue;
-			if (certaddrlen == addrlen && !memcmp(addrbuf, certaddr, addrlen))
-				goto done;
-		}
-	badhost:
+	if (vpninfo->sni) {
+		if (!crt_check_hostname_or_ip(cert, vpninfo->sni))
+			reason = _("certificate does not match SNI");
+	} else if (!crt_check_hostname_or_ip(cert, vpninfo->hostname))
 		reason = _("certificate does not match hostname");
-	}
  done:
 	if (reason) {
 		vpn_progress(vpninfo, PRG_INFO,
@@ -2345,7 +2365,11 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
 	 *
 	 * See comments above regarding COMPAT and DUMBFW.
 	 */
-	if (string_is_hostname(vpninfo->hostname))
+	if (vpninfo->sni)
+		gnutls_server_name_set(vpninfo->https_sess, GNUTLS_NAME_DNS,
+				       vpninfo->sni,
+				       strlen(vpninfo->sni));
+	else if (string_is_hostname(vpninfo->hostname))
 		gnutls_server_name_set(vpninfo->https_sess, GNUTLS_NAME_DNS,
 				       vpninfo->hostname,
 				       strlen(vpninfo->hostname));
@@ -2405,6 +2429,8 @@ int openconnect_open_https(struct openconnect_info *vpninfo)
 			buf_append(buf, ":+3DES-CBC:+ARCFOUR-128:+SHA1");
 			if (gnutls_check_version_numeric(3,6,0))
 				buf_append(buf, ":%%VERIFY_ALLOW_SIGN_WITH_SHA1");
+			if (gnutls_check_version_numeric(2,11,3))
+				buf_append(buf, ":%%UNSAFE_RENEGOTIATION");
 		} else
 			buf_append(buf, ":-3DES-CBC:-ARCFOUR-128");
 
@@ -2484,10 +2510,11 @@ int cstp_handshake(struct openconnect_info *vpninfo, unsigned init)
 				FD_SET(ssl_sock, &rd_set);
 
 			cmd_fd_set(vpninfo, &rd_set, &maxfd);
-			if (select(maxfd + 1, &rd_set, &wr_set, NULL, NULL) < 0 &&
-			    errno != EINTR) {
-				vpn_perror(vpninfo, _("Failed select() for TLS"));
-				return -EIO;
+			while (select(maxfd + 1, &rd_set, &wr_set, NULL, NULL) < 0) {
+				if (errno != EINTR) {
+					vpn_perror(vpninfo, _("Failed select() for TLS"));
+					return -EIO;
+				}
 			}
 			if (is_cancel_pending(vpninfo, &rd_set)) {
 				vpn_progress(vpninfo, PRG_ERR, _("SSL connection cancelled\n"));
@@ -2497,8 +2524,12 @@ int cstp_handshake(struct openconnect_info *vpninfo, unsigned init)
 				return -EINTR;
 			}
 		} else if (gnutls_error_is_fatal(err)) {
-			vpn_progress(vpninfo, PRG_ERR, _("SSL connection failure: %s\n"),
-							 gnutls_strerror(err));
+			if (err == GNUTLS_E_FATAL_ALERT_RECEIVED)
+				vpn_progress(vpninfo, PRG_ERR, _("SSL connection failure due to fatal alert: %s\n"),
+					     gnutls_alert_get_name(gnutls_alert_get(vpninfo->https_sess)));
+			else
+				vpn_progress(vpninfo, PRG_ERR, _("SSL connection failure: %s\n"),
+								 gnutls_strerror(err));
 			gnutls_deinit(vpninfo->https_sess);
 			vpninfo->https_sess = NULL;
 			closesocket(ssl_sock);
@@ -2563,11 +2594,9 @@ char *get_gnutls_cipher(gnutls_session_t session)
 
 int openconnect_sha1(unsigned char *result, void *data, int datalen)
 {
-	gnutls_datum_t d;
+	const gnutls_datum_t d = { data, datalen };
 	size_t shalen = SHA1_SIZE;
 
-	d.data = data;
-	d.size = datalen;
 	if (gnutls_fingerprint(GNUTLS_DIG_SHA1, &d, result, &shalen))
 		return -1;
 
@@ -2576,11 +2605,9 @@ int openconnect_sha1(unsigned char *result, void *data, int datalen)
 
 int openconnect_sha256(unsigned char *result, void *data, int datalen)
 {
-	gnutls_datum_t d;
+	const gnutls_datum_t d = { data, datalen };
 	size_t shalen = SHA256_SIZE;
 
-	d.data = data;
-	d.size = datalen;
 	if (gnutls_fingerprint(GNUTLS_DIG_SHA256, &d, result, &shalen))
 		return -1;
 
@@ -2589,11 +2616,9 @@ int openconnect_sha256(unsigned char *result, void *data, int datalen)
 
 int openconnect_md5(unsigned char *result, void *data, int datalen)
 {
-	gnutls_datum_t d;
+	const gnutls_datum_t d = { data, datalen };
 	size_t md5len = MD5_SIZE;
 
-	d.data = data;
-	d.size = datalen;
 	if (gnutls_fingerprint(GNUTLS_DIG_MD5, &d, result, &md5len))
 		return -1;
 
@@ -3048,11 +3073,9 @@ int ecdh_compute_secp256r1(struct openconnect_info *vpninfo, const unsigned char
 }
 
 int hkdf_sha256_extract_expand(struct openconnect_info *vpninfo, unsigned char *buf,
-			       const char *info, int infolen)
+			       const unsigned char *info, int infolen)
 {
-	gnutls_datum_t d;
-	d.data = buf;
-	d.size = SHA256_SIZE;
+	const gnutls_datum_t d = { buf, SHA256_SIZE };
 
 	int err = gnutls_hkdf_extract(GNUTLS_MAC_SHA256, &d, NULL, buf);
 	if (err) {
@@ -3062,9 +3085,7 @@ int hkdf_sha256_extract_expand(struct openconnect_info *vpninfo, unsigned char *
 		return -EIO;
 	}
 
-	gnutls_datum_t info_d;
-	info_d.data = (void *)info;
-	info_d.size = infolen;
+	const gnutls_datum_t info_d = { (unsigned char *)info, infolen };
 
 	err = gnutls_hkdf_expand(GNUTLS_MAC_SHA256, &d, &info_d, d.data, d.size);
 	if (err) {
@@ -3082,8 +3103,8 @@ int aes_256_gcm_decrypt(struct openconnect_info *vpninfo, unsigned char *key,
 {
 	gnutls_cipher_hd_t h = NULL;
 
-	gnutls_datum_t d = { key, SHA256_SIZE };
-	gnutls_datum_t iv_d = { iv, 12 };
+	const gnutls_datum_t d = { key, SHA256_SIZE };
+	const gnutls_datum_t iv_d = { iv, 12 };
 
 	int err = gnutls_cipher_init(&h, GNUTLS_CIPHER_AES_256_GCM, &d, &iv_d);
 	if (err) {

@@ -50,7 +50,7 @@ struct openconnect_info *openconnect_vpninfo_new(const char *useragent,
 						 openconnect_progress_vfn progress,
 						 void *privdata)
 {
-	struct openconnect_info *vpninfo = calloc(sizeof(*vpninfo), 1);
+	struct openconnect_info *vpninfo = calloc(1, sizeof(*vpninfo));
 #ifdef HAVE_ICONV
 	char *charset = nl_langinfo(CODESET);
 #endif
@@ -73,6 +73,9 @@ struct openconnect_info *openconnect_vpninfo_new(const char *useragent,
 #ifndef _WIN32
 	vpninfo->tun_fd = -1;
 #endif
+#if defined(DEFAULT_EXTERNAL_BROWSER)
+	vpninfo->external_browser = DEFAULT_EXTERNAL_BROWSER;
+#endif
 	init_pkt_queue(&vpninfo->free_queue);
 	init_pkt_queue(&vpninfo->incoming_queue);
 	init_pkt_queue(&vpninfo->outgoing_queue);
@@ -84,7 +87,7 @@ struct openconnect_info *openconnect_vpninfo_new(const char *useragent,
 	vpninfo->tncc_fd = -1;
 	vpninfo->cert_expire_warning = 60 * 86400;
 	vpninfo->req_compr = COMPR_STATELESS;
-	vpninfo->max_qlen = 10;
+	vpninfo->max_qlen = 32;	  /* >=16 will enable vhost-net on Linux */
 	vpninfo->localname = strdup("localhost");
 	vpninfo->port = 443;
 	vpninfo->useragent = openconnect_create_useragent(useragent);
@@ -206,7 +209,7 @@ static const struct vpn_proto openconnect_protos[] = {
 		.pretty_name = N_("F5 BIG-IP SSL VPN"),
 		.description = N_("Compatible with F5 BIG-IP SSL VPN"),
 		.proto = PROTO_F5,
-		.flags = OC_PROTO_PROXY | OC_PROTO_AUTH_CERT,
+		.flags = OC_PROTO_PROXY | OC_PROTO_AUTH_CERT | OC_PROTO_AUTH_OTP | OC_PROTO_AUTH_STOKEN,
 		.vpn_close_session = f5_bye,
 		.tcp_connect = f5_connect,
 		.tcp_mainloop = ppp_tcp_mainloop,
@@ -568,6 +571,21 @@ int install_vpn_opts(struct openconnect_info *vpninfo, struct oc_vpn_option *opt
 			     ip_info->mtu);
 	}
 
+	/* XX: Supported protocols and servers are inconsistent in how they send us
+	 * multiple search domains. Some provide domains via repeating fields which we
+	 * glom into a single space-separated string, some provide domains in single
+	 * fields which contain ',' or ';' as separators.
+	 *
+	 * Since neither ',' nor ';' is a legal character in a domain name, and since all
+	 * known routing configuration scripts support space-separated domains, we can
+	 * safely replace these characters with spaces, and thus support all known
+	 * combinations.
+	 */
+	for (char *p = (char *)ip_info->domain; p && *p; p++) {
+		if (*p == ';' || *p == ',')
+			*p = ' ';
+	}
+
 	/* Free the original options */
 	free_split_routes(&vpninfo->ip_info);
 	free_optlist(vpninfo->cstp_options);
@@ -652,6 +670,7 @@ void openconnect_vpninfo_free(struct openconnect_info *vpninfo)
 	free_split_routes(&vpninfo->ip_info);
 	free(vpninfo->hostname);
 	free(vpninfo->unique_hostname);
+	free(vpninfo->sni);
 	buf_free(vpninfo->connect_urlbuf);
 	free(vpninfo->urlpath);
 	free(vpninfo->redirect_url);
@@ -796,7 +815,7 @@ const char *openconnect_get_connect_url(struct openconnect_info *vpninfo)
 	 * https://gitlab.gnome.org/GNOME/NetworkManager-openconnect/-/issues/53
 	 * https://gitlab.gnome.org/GNOME/NetworkManager-openconnect/-/merge_requests/22
 	 */
-	if (vpninfo->proto->proto == PROTO_PULSE)
+	if (vpninfo->proto->proto == PROTO_PULSE && vpninfo->urlpath)
 		buf_append(urlbuf, "%s", vpninfo->urlpath);
 	if (buf_error(urlbuf)) {
 		buf_free(urlbuf);
@@ -863,6 +882,15 @@ int openconnect_set_localname(struct openconnect_info *vpninfo,
 	UTF8CHECK(localname);
 
 	STRDUP(vpninfo->localname, localname);
+	return 0;
+}
+
+int openconnect_set_sni(struct openconnect_info *vpninfo,
+			      const char *sni)
+{
+	UTF8CHECK(sni);
+
+	STRDUP(vpninfo->sni, sni);
 	return 0;
 }
 
