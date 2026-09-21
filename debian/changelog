@@ -1,3 +1,9 @@
+openconnect (9.12-3+deb13u2deepin1) unstable; urgency=medium
+
+  * Rebuild with LTO enabled (dpkg vendor feature optimize/lto).
+
+ -- tunaichao <tunaichao@uniontech.com>  Mon, 21 Sep 2026 15:58:40 +0800
+
 openconnect (9.12-3+deb13u2) trixie; urgency=medium
 
   * Non-maintainer upload.
